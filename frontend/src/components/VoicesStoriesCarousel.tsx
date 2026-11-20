@@ -17,6 +17,7 @@ export default function VoicesStoriesCarousel({ currentSlot }: VoicesStoriesCaro
   const [slots, setSlots] = useState<SlotStatus[]>([]);
   const [canScrollLeft, setCanScrollLeft] = useState<boolean>(false);
   const [canScrollRight, setCanScrollRight] = useState<boolean>(true);
+  const [failedAvatarSlots, setFailedAvatarSlots] = useState<Set<number>>(new Set());
   const scrollContainerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -133,12 +134,15 @@ export default function VoicesStoriesCarousel({ currentSlot }: VoicesStoriesCaro
                 <div className="rounded-full bg-black p-[2px]">
                   {/* Inner Circular Avatar */}
                   <div className="w-14 h-14 sm:w-16 sm:h-16 rounded-full overflow-hidden bg-[#242526] flex items-center justify-center">
-                    {slot.avatar_url ? (
+                    {slot.avatar_url && !failedAvatarSlots.has(slot.slot_number) ? (
                       // eslint-disable-next-line @next/next/no-img-element
                       <img
-                        src={resolveMediaUrl(slot.avatar_url)}
+                        src={resolveMediaUrl(slot.avatar_url, "avatar")}
                         alt={originalName}
+                        loading="lazy"
+                        decoding="async"
                         className="w-full h-full object-cover transition-transform duration-300 group-hover/item:scale-110"
+                        onError={() => setFailedAvatarSlots((prev) => new Set(prev).add(slot.slot_number))}
                       />
                     ) : (
                       <span className="font-bold text-base sm:text-lg text-white">

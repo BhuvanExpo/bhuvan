@@ -14,6 +14,9 @@ interface PostCardProps {
 export default function PostCard({ broadcast }: PostCardProps) {
   const isTitan = broadcast.slot_number === 10;
   const [imgError, setImgError] = useState(false);
+  const [mediaLoading, setMediaLoading] = useState<boolean>(true);
+  const [mediaError, setMediaError] = useState<boolean>(false);
+  const [reloadKey, setReloadKey] = useState<number>(0);
 
   // Social interactions state
   const [isLiked, setIsLiked] = useState<boolean>(false);
@@ -169,7 +172,7 @@ export default function PostCard({ broadcast }: PostCardProps) {
                 >
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
-                    src={resolveMediaUrl(broadcast.avatar_url)}
+                    src={resolveMediaUrl(broadcast.avatar_url, "avatar")}
                     alt={originalName}
                     className="w-full h-full object-cover group-hover:scale-105 transition-transform"
                     onError={() => setImgError(true)}
@@ -225,16 +228,52 @@ export default function PostCard({ broadcast }: PostCardProps) {
           </p>
         </div>
 
-        {/* Optional Media Container (Edge-to-edge inside card) */}
-        {broadcast.media_url && (
-          <div className="w-full overflow-hidden bg-black flex justify-center max-h-[520px]">
+        {/* Optional Media Container with Progressive Loading & Error Fallback */}
+        {broadcast.media_url && !mediaError && (
+          <div className="relative w-full overflow-hidden bg-[#18191a] flex justify-center min-h-[220px] max-h-[520px]">
+            {mediaLoading && (
+              <div className="absolute inset-0 bg-neutral-900/80 animate-pulse flex items-center justify-center">
+                <div className="flex items-center space-x-2 text-xs font-mono text-neutral-400">
+                  <span className="w-2 h-2 rounded-full bg-[#0095f6] animate-ping" />
+                  <span>Loading media...</span>
+                </div>
+              </div>
+            )}
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img
-              src={resolveMediaUrl(broadcast.media_url)}
+              key={`${broadcast.id}-${reloadKey}`}
+              src={resolveMediaUrl(broadcast.media_url, "post")}
               alt="Broadcast attachment"
-              className="w-full h-auto object-cover max-h-[520px]"
+              className={`w-full h-auto object-cover max-h-[520px] transition-opacity duration-300 ${
+                mediaLoading ? "opacity-0" : "opacity-100"
+              }`}
               loading="lazy"
+              decoding="async"
+              onLoad={() => setMediaLoading(false)}
+              onError={() => {
+                setMediaLoading(false);
+                setMediaError(true);
+              }}
             />
+          </div>
+        )}
+
+        {broadcast.media_url && mediaError && (
+          <div className="w-full p-4 bg-[#18191a]/80 border-y border-white/5 flex items-center justify-between text-xs font-mono text-neutral-400">
+            <span className="flex items-center space-x-2">
+              <span className="w-2 h-2 rounded-full bg-amber-400" />
+              <span>Attachment unavailable</span>
+            </span>
+            <button
+              onClick={() => {
+                setMediaError(false);
+                setMediaLoading(true);
+                setReloadKey((k) => k + 1);
+              }}
+              className="px-2.5 py-1 rounded bg-white/10 hover:bg-white/20 text-white text-[11px] transition-colors cursor-pointer"
+            >
+              Retry
+            </button>
           </div>
         )}
 

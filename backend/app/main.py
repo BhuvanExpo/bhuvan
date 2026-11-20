@@ -69,6 +69,14 @@ def get_client_ip(request: Request) -> str:
         return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
+def get_public_base_url(request: Request) -> str:
+    """Extracts true public base URL considering reverse proxies (e.g. Render) and HTTPS termination."""
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("x-forwarded-host", request.headers.get("host", request.url.netloc))
+    if settings.ENVIRONMENT == "production" and not host.startswith("localhost") and not host.startswith("127.0.0.1"):
+        proto = "https"
+    return f"{proto}://{host}".rstrip("/")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: initialize connection pools and Redis subscriber
@@ -343,7 +351,7 @@ async def upload_media(request: Request, response: Response, file: UploadFile = 
             detail=f"Upload rate limit exceeded. Please wait {retry_after} seconds."
         )
 
-    base_url = str(request.base_url).rstrip("/")
+    base_url = get_public_base_url(request)
     result = await upload_file_to_storage(file, base_url)
     return result
 

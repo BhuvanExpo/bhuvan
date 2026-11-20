@@ -75,6 +75,8 @@ export default function VoiceProfilePage() {
   const [broadcasts, setBroadcasts] = useState<Broadcast[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [avatarError, setAvatarError] = useState<boolean>(false);
+  const [coverError, setCoverError] = useState<boolean>(false);
 
   // Follow state for viewers
   const [isFollowing, setIsFollowing] = useState<boolean>(false);
@@ -528,12 +530,15 @@ export default function VoiceProfilePage() {
       <div className="max-w-[800px] mx-auto pb-16">
         {/* Cover Banner (Zero sovereign voice tag) */}
         <div className="relative w-full h-44 sm:h-64 rounded-b-2xl overflow-hidden bg-gradient-to-r from-neutral-900 via-[#1c1d1f] to-neutral-900 border-x border-b border-white/10 shadow-2xl">
-          {slotData?.cover_url ? (
+          {slotData?.cover_url && !coverError ? (
             // eslint-disable-next-line @next/next/no-img-element
             <img
-              src={resolveMediaUrl(slotData.cover_url)}
+              src={resolveMediaUrl(slotData.cover_url, "cover")}
               alt="Cover banner"
+              loading="lazy"
+              decoding="async"
               className="w-full h-full object-cover"
+              onError={() => setCoverError(true)}
             />
           ) : (
             <>
@@ -555,12 +560,15 @@ export default function VoiceProfilePage() {
                   isTitan ? "ring-2 ring-white" : "ring-2 ring-white/20"
                 }`}
               >
-                {slotData?.avatar_url ? (
+                {slotData?.avatar_url && !avatarError ? (
                   // eslint-disable-next-line @next/next/no-img-element
                   <img
-                    src={resolveMediaUrl(slotData.avatar_url)}
+                    src={resolveMediaUrl(slotData.avatar_url, "avatar")}
                     alt={voiceIdentity.originalName}
+                    loading="lazy"
+                    decoding="async"
                     className="w-full h-full object-cover"
+                    onError={() => setAvatarError(true)}
                   />
                 ) : (
                   <div className="w-full h-full flex items-center justify-center font-bold text-3xl text-white bg-[#242526]">

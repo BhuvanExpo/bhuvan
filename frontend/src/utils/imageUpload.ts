@@ -105,20 +105,76 @@ export async function uploadImageDirectly(
   const data = await res.json();
   return {
     url: data.url,
-    relativePath: data.relative_path,
+    relativePath: data.relative_path || data.url,
   };
 }
 
 /**
- * Resolves any relative media URL (like /uploads/xyz.jpg) to a fully qualified URL
+ * Resolves and optimizes any media URL (local uploads, S3, or external CDNs like Unsplash).
+ * Handles:
+ * 1. Rewriting obsolete/local development URLs (e.g. localhost:8000/uploads/...) to the live backend API.
+ * 2. Mixed content auto-upgrade (http -> https).
+ * 3. Dynamic image compression & dimension clamping for Unsplash/external images (down from 4MB to ~80KB).
  */
-export function resolveMediaUrl(url?: string | null): string {
-  if (!url) return "";
-  if (url.startsWith("http://") || url.startsWith("https://") || url.startsWith("data:")) {
-    return url;
+export function resolveMediaUrl(
+  url?: string | null,
+  variant: "post" | "avatar" | "cover" | "thumb" = "post"
+): string {
+  if (!url || typeof url !== "string") return "";
+
+  let cleaned = url.trim();
+
+  // 1. Rewrite obsolete localhost / internal host references to the active production backend
+  if (
+    cleaned.includes("localhost:8000/uploads/") ||
+    cleaned.includes("127.0.0.1:8000/uploads/") ||
+    cleaned.includes("0.0.0.0:8000/uploads/")
+  ) {
+    const filename = cleaned.split("/uploads/")[1];
+    cleaned = `${API_BASE_URL.replace(/\/$/, "")}/uploads/${filename}`;
+  } else if (cleaned.startsWith("/uploads/")) {
+    cleaned = `${API_BASE_URL.replace(/\/$/, "")}${cleaned}`;
+  } else if (!cleaned.startsWith("http://") && !cleaned.startsWith("https://") && !cleaned.startsWith("data:")) {
+    cleaned = `${API_BASE_URL.replace(/\/$/, "")}/${cleaned.replace(/^\//, "")}`;
   }
-  if (url.startsWith("/")) {
-    return `${API_BASE_URL}${url}`;
+
+  // 2. Mixed content security: upgrade http:// to https:// in production
+  if (
+    typeof window !== "undefined" &&
+    window.location.protocol === "https:" &&
+    cleaned.startsWith("http://") &&
+    !cleaned.includes("localhost") &&
+    !cleaned.includes("127.0.0.1")
+  ) {
+    cleaned = cleaned.replace(/^http:\/\//i, "https://");
   }
-  return `${API_BASE_URL}/${url}`;
+
+  // 3. Ultra-fast compression for Unsplash images (prevents downloading 4MB 4K originals)
+  if (cleaned.includes("images.unsplash.com")) {
+    try {
+      const u = new URL(cleaned);
+      u.searchParams.set("auto", "format");
+      if (variant === "avatar" || variant === "thumb") {
+        u.searchParams.set("w", "200");
+        u.searchParams.set("h", "200");
+        u.searchParams.set("fit", "crop");
+        u.searchParams.set("crop", "faces");
+        u.searchParams.set("q", "80");
+      } else if (variant === "cover") {
+        u.searchParams.set("w", "1080");
+        u.searchParams.set("fit", "crop");
+        u.searchParams.set("q", "75");
+      } else {
+        // "post"
+        u.searchParams.set("w", "800");
+        u.searchParams.set("fit", "crop");
+        u.searchParams.set("q", "75");
+      }
+      return u.toString();
+    } catch {
+      return cleaned;
+    }
+  }
+
+  return cleaned;
 }
