@@ -15,6 +15,22 @@ def get_clean_dsn(dsn: str) -> str:
         return "postgresql://" + dsn[len("postgres://"):]
     return dsn
 
+async def ensure_schema(pool: asyncpg.Pool):
+    """Safely adds any missing profile columns to existing databases."""
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                ALTER TABLE slots ADD COLUMN IF NOT EXISTS real_name VARCHAR(100);
+                ALTER TABLE slots ADD COLUMN IF NOT EXISTS avatar_url TEXT;
+                ALTER TABLE slots ADD COLUMN IF NOT EXISTS cover_url TEXT;
+                ALTER TABLE slots ADD COLUMN IF NOT EXISTS bio TEXT;
+                ALTER TABLE slots ADD COLUMN IF NOT EXISTS links JSONB DEFAULT '[]'::jsonb;
+                ALTER TABLE slots ADD COLUMN IF NOT EXISTS followers_count INT DEFAULT 0;
+            """)
+            logger.info("Database schema verified and synchronized.")
+    except Exception as e:
+        logger.warning(f"Schema verification note: {e}")
+
 async def init_db_pool() -> Optional[asyncpg.Pool]:
     global _pool
     try:
@@ -33,6 +49,7 @@ async def init_db_pool() -> Optional[asyncpg.Pool]:
             ssl=ssl_mode
         )
         logger.info("PostgreSQL connection pool initialized successfully.")
+        await ensure_schema(_pool)
         return _pool
     except Exception as e:
         logger.warning(f"Could not connect to database on startup: {e}. (Will retry on requests)")

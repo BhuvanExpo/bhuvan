@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, HTTPException, Request, Response, status, Query, File, UploadFile
+from fastapi import FastAPI, HTTPException, Request, Response, status, Query, File, UploadFile, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -24,6 +24,7 @@ from app.db import (
     insert_broadcast,
     get_recent_broadcasts,
     update_slot_profile,
+    toggle_follow_slot,
     check_db_health,
     get_admin_stats,
     admin_create_or_assign_slot,
@@ -43,13 +44,17 @@ from app.redis_client import (
     register_listener,
     unregister_listener,
     check_redis_health,
+    start_redis_subscriber,
 )
 from app.security import (
     validate_replay_window,
     construct_canonical_message,
     construct_canonical_profile_message,
     verify_signature,
+    verify_admin_auth,
 )
+from app.rate_limiter import is_rate_limited
+from app.storage import upload_file_to_storage, UPLOAD_DIR
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,12 +62,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("broadcast.api")
 
+def get_client_ip(request: Request) -> str:
+    """Extracts client IP from proxy headers or direct socket connection."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: initialize connection pools
+    # Startup: initialize connection pools and Redis subscriber
     logger.info("Starting up BHUVAN Global Broadcast backend...")
     await init_db_pool()
     await init_redis()
+    await start_redis_subscriber()
     yield
     # Shutdown: clean up connections
     logger.info("Shutting down backend services...")
@@ -76,18 +89,17 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Apply CORS middleware for spectator & admin access
+# Apply CORS middleware with secure origin validation
+is_wildcard = settings.cors_origins_list == ["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list,
-    allow_credentials=True,
+    allow_credentials=not is_wildcard,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Uploads directory and static file mounting
-UPLOAD_DIR = Path(__file__).resolve().parent.parent / "uploads"
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+# Mount local uploads static directory for fallback
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 # ==============================================================================
@@ -147,6 +159,9 @@ class SlotsMatrixResponse(BaseModel):
     slots: List[SlotStatus]
     slot_10_cooldown: Slot10CooldownInfo
 
+class FollowRequest(BaseModel):
+    delta: int = Field(1, ge=-1, le=1)
+
 # Admin Command Center Schemas
 class AdminSlotCreateRequest(BaseModel):
     slot_number: Optional[int] = Field(None, ge=1, description="Specific slot number, or omit to auto-assign")
@@ -190,15 +205,29 @@ class AdminBroadcastItem(BaseModel):
     response_model=BroadcastResponse,
     summary="Publish an immutable broadcast (Strictly Slot Holders 1-10)"
 )
-async def post_broadcast(payload: BroadcastRequest, response: Response):
+async def post_broadcast(payload: BroadcastRequest, request: Request, response: Response):
     """
     Ingest a new immutable broadcast from one of the 10 Genesis slots:
-    1. Replay attack guard (must be within +/- 5 minutes of server UTC time)
-    2. Titan Rule: Slot #10 rate limit check (168-hour / 7-day cooldown)
-    3. Ed25519 digital signature cryptographic verification
-    4. Immutable insert into PostgreSQL
-    5. Write-through to Redis memory cache and SSE distribution
+    1. Anti-abuse rate limit check per IP and slot
+    2. Replay attack guard (must be within +/- 5 minutes of server UTC time)
+    3. Titan Rule: Slot #10 rate limit check (168-hour / 7-day cooldown)
+    4. Ed25519 digital signature cryptographic verification
+    5. Immutable insert into PostgreSQL
+    6. Write-through to Redis memory cache and multi-instance SSE distribution
     """
+    client_ip = get_client_ip(request)
+    is_limited, retry_after = await is_rate_limited(
+        f"bcast:{payload.slot_number}:{client_ip}",
+        settings.RATE_LIMIT_BROADCAST_PER_MINUTE,
+        window_seconds=60
+    )
+    if is_limited:
+        response.headers["Retry-After"] = str(retry_after)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Broadcast rate limit exceeded. Please wait {retry_after} seconds."
+        )
+
     # 1. Replay Attack Guard
     is_valid_time, replay_error, parsed_time = validate_replay_window(
         payload.timestamp,
@@ -282,60 +311,41 @@ async def post_broadcast(payload: BroadcastRequest, response: Response):
             detail="Failed to persist broadcast to immutable ledger."
         )
 
-    # 6. Write-Through to Redis Cache & SSE Fanout
+    # 6. Write-Through to Redis Cache & Multi-Instance SSE Fanout
     await write_through_broadcast(inserted_record)
 
     logger.info(f"Broadcast from Slot #{payload.slot_number:02d} verified and published: ID {inserted_record['id']}")
     return inserted_record
 
 # ==============================================================================
-# DIRECT DEVICE MEDIA UPLOAD (CAMERA & STORAGE)
+# SECURE DIRECT DEVICE MEDIA UPLOAD (CAMERA & STORAGE)
 # ==============================================================================
 
 @app.post(
     "/api/v1/upload",
-    summary="Upload image media directly from device camera or storage"
+    summary="Upload image media securely from device camera or storage"
 )
-async def upload_media(request: Request, file: UploadFile = File(...)):
+async def upload_media(request: Request, response: Response, file: UploadFile = File(...)):
     """
     Accepts an image directly from device storage or camera capture.
-    Stores securely in the local uploads directory and returns its accessible public URL.
+    Validates magic bytes, strips metadata, and stores securely in local storage or S3/R2.
     """
-    if not file.content_type or not file.content_type.startswith("image/"):
+    client_ip = get_client_ip(request)
+    is_limited, retry_after = await is_rate_limited(
+        f"upload:{client_ip}",
+        settings.RATE_LIMIT_UPLOAD_PER_MINUTE,
+        window_seconds=60
+    )
+    if is_limited:
+        response.headers["Retry-After"] = str(retry_after)
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid file format. Please upload an image (JPEG, PNG, WebP, GIF, AVIF, HEIC)."
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Upload rate limit exceeded. Please wait {retry_after} seconds."
         )
-
-    # 15MB file size ceiling
-    MAX_FILE_SIZE = 15 * 1024 * 1024
-    content = await file.read()
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="File size exceeds maximum allowed limit of 15MB."
-        )
-
-    orig_ext = Path(file.filename).suffix.lower() if file.filename else ".jpg"
-    if orig_ext not in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".heic"]:
-        orig_ext = ".jpg"
-
-    unique_filename = f"{uuid.uuid4().hex}{orig_ext}"
-    dest_path = UPLOAD_DIR / unique_filename
-
-    with open(dest_path, "wb") as f:
-        f.write(content)
 
     base_url = str(request.base_url).rstrip("/")
-    public_url = f"{base_url}/uploads/{unique_filename}"
-
-    return {
-        "url": public_url,
-        "relative_path": f"/uploads/{unique_filename}",
-        "filename": unique_filename,
-        "size": len(content),
-        "content_type": file.content_type
-    }
+    result = await upload_file_to_storage(file, base_url)
+    return result
 
 # ==============================================================================
 # READ-ONLY SPECTATOR FEED & STREAM (100k+ CONCURRENT CAPACITY)
@@ -347,6 +357,7 @@ async def upload_media(request: Request, file: UploadFile = File(...)):
     summary="Read-only chronological broadcast feed (Cache-first)"
 )
 async def get_feed(
+    response: Response,
     slot_number: Optional[int] = Query(None, ge=1, description="Filter by Slot #"),
     limit: int = Query(50, ge=1, le=100, description="Max broadcasts to retrieve")
 ):
@@ -354,7 +365,11 @@ async def get_feed(
     Returns the immutable chronological feed.
     Zero-mock architecture: returns only genuine verified broadcasts.
     Reads from Redis in-memory cache first to shield PostgreSQL.
+    Edge CDN caching enabled via Cache-Control headers.
     """
+    # CDN Edge caching header for Cloudflare/Vercel edge shields backend from 100k spectators
+    response.headers["Cache-Control"] = "public, max-age=2, s-maxage=5, stale-while-revalidate=10"
+
     # 1. Try Redis cache
     cached = await get_cached_feed(slot_number=slot_number)
     if cached is not None:
@@ -363,7 +378,6 @@ async def get_feed(
     # 2. Cache miss -> query PostgreSQL
     try:
         db_records = await get_recent_broadcasts(slot_number=slot_number, limit=limit)
-        # Update cache asynchronously
         await set_cached_feed(db_records, slot_number=slot_number)
         return db_records
     except Exception as e:
@@ -377,11 +391,10 @@ async def get_feed(
 async def stream_live_broadcasts(request: Request):
     """
     SSE stream for spectators. Subscribes to real-time broadcasts
-    so 100,000+ concurrent spectators receive instant push updates
-    the exact moment a post is published, with zero page reloads.
+    so spectators receive instant push updates the exact moment
+    a post is published across any node in the cluster.
     """
     async def event_generator():
-        # Yield initial connection confirmation
         yield "event: connected\ndata: {\"status\": \"connected\"}\n\n"
 
         q = register_listener()
@@ -390,12 +403,10 @@ async def stream_live_broadcasts(request: Request):
 
         try:
             while True:
-                # Check for client disconnect
                 if await request.is_disconnected():
                     break
 
                 try:
-                    # Wait for message with short timeout to allow keepalive and disconnect check
                     broadcast = await asyncio.wait_for(q.get(), timeout=2.0)
                     event_data = f"event: broadcast\ndata: {json.dumps(broadcast)}\n\n"
                     yield event_data
@@ -403,7 +414,6 @@ async def stream_live_broadcasts(request: Request):
                 except asyncio.TimeoutError:
                     pass
 
-                # Send keepalive comment to avoid proxy/browser timeouts
                 now = asyncio.get_event_loop().time()
                 if now - last_keepalive >= keepalive_interval:
                     yield ": keepalive\n\n"
@@ -420,7 +430,7 @@ async def stream_live_broadcasts(request: Request):
         headers={
             "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",  # Disables nginx proxy buffering
+            "X-Accel-Buffering": "no",
         }
     )
 
@@ -429,18 +439,19 @@ async def stream_live_broadcasts(request: Request):
     response_model=SlotsMatrixResponse,
     summary="10-Slot Status Matrix & Slot #10 Cooldown Matrix"
 )
-async def get_slots_status():
+async def get_slots_status(response: Response):
     """
     Returns the real-time status of all 10 slots and the active cooldown
     timer for Slot #10 (The Titan Rule).
     """
+    response.headers["Cache-Control"] = "public, max-age=5, s-maxage=10, stale-while-revalidate=15"
+
     slots_list: List[Dict[str, Any]] = []
     try:
         slots_list = await get_all_slots()
     except Exception as e:
         logger.warning(f"Could not load slots from DB: {e}")
 
-    # Calculate Slot #10 Cooldown
     last_10_time = await get_slot_10_last_broadcast_time()
     cooldown_info = Slot10CooldownInfo(is_locked=False, cooldown_total_hours=settings.SLOT_10_COOLDOWN_HOURS)
 
@@ -456,7 +467,6 @@ async def get_slots_status():
             cooldown_info.is_locked = True
             cooldown_info.cooldown_seconds_remaining = remaining_seconds
 
-    # Build slot statuses dynamically
     final_slots: List[SlotStatus] = []
     if slots_list:
         for data in slots_list:
@@ -605,17 +615,32 @@ async def update_profile(slot_number: int, payload: UpdateProfileRequest):
         public_key_hex=updated["public_key_hex"]
     )
 
-class FollowRequest(BaseModel):
-    delta: int = Field(1, ge=-1, le=1)
-
 @app.post(
     "/api/v1/slots/{slot_number}/follow",
     summary="Toggle follow for a Sovereign Voice"
 )
-async def follow_slot_endpoint(slot_number: int, payload: FollowRequest):
+async def follow_slot_endpoint(
+    slot_number: int,
+    payload: FollowRequest,
+    request: Request,
+    response: Response
+):
     if slot_number < 1:
         raise HTTPException(status_code=400, detail="Invalid slot number (must be >= 1)")
-    from app.db import toggle_follow_slot
+
+    client_ip = get_client_ip(request)
+    is_limited, retry_after = await is_rate_limited(
+        f"follow:{client_ip}:{slot_number}",
+        settings.RATE_LIMIT_FOLLOW_PER_MINUTE,
+        window_seconds=60
+    )
+    if is_limited:
+        response.headers["Retry-After"] = str(retry_after)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Follow action rate limit exceeded. Please wait {retry_after} seconds."
+        )
+
     new_count = await toggle_follow_slot(slot_number, delta=payload.delta)
     try:
         from app.redis_client import get_redis
@@ -643,7 +668,7 @@ async def health_check():
     )
 
 # ==============================================================================
-# ADMIN COMMAND CENTER ENDPOINTS
+# SECURED ADMIN COMMAND CENTER ENDPOINTS (PROTECTED VIA ADMIN SECRET KEY)
 # ==============================================================================
 
 async def _invalidate_admin_caches(slot_number: Optional[int] = None):
@@ -658,7 +683,11 @@ async def _invalidate_admin_caches(slot_number: Optional[int] = None):
     except Exception as e:
         logger.warning(f"Could not invalidate redis cache: {e}")
 
-@app.get("/api/v1/admin/stats", summary="Command Center system & network telemetry")
+@app.get(
+    "/api/v1/admin/stats",
+    summary="Command Center system & network telemetry",
+    dependencies=[Depends(verify_admin_auth)]
+)
 async def get_command_center_stats():
     stats = await get_admin_stats()
     db_ok = await check_db_health()
@@ -689,7 +718,11 @@ async def get_command_center_stats():
         }
     }
 
-@app.post("/api/v1/admin/slots", summary="Create or assign a new Sovereign Voice user")
+@app.post(
+    "/api/v1/admin/slots",
+    summary="Create or assign a new Sovereign Voice user",
+    dependencies=[Depends(verify_admin_auth)]
+)
 async def admin_create_slot_endpoint(payload: AdminSlotCreateRequest):
     try:
         res = await admin_create_or_assign_slot(
@@ -709,7 +742,11 @@ async def admin_create_slot_endpoint(payload: AdminSlotCreateRequest):
         logger.error(f"Error creating voice slot: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.put("/api/v1/admin/slots/{slot_number}", summary="Update Sovereign Voice details")
+@app.put(
+    "/api/v1/admin/slots/{slot_number}",
+    summary="Update Sovereign Voice details",
+    dependencies=[Depends(verify_admin_auth)]
+)
 async def admin_update_slot_endpoint(slot_number: int, payload: AdminSlotUpdateRequest):
     try:
         updated = await admin_update_slot(
@@ -730,7 +767,11 @@ async def admin_update_slot_endpoint(slot_number: int, payload: AdminSlotUpdateR
         logger.error(f"Error updating slot #{slot_number}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/v1/admin/slots/{slot_number}/rotate-key", summary="Rotate keypair for a slot")
+@app.post(
+    "/api/v1/admin/slots/{slot_number}/rotate-key",
+    summary="Rotate keypair for a slot",
+    dependencies=[Depends(verify_admin_auth)]
+)
 async def admin_rotate_key_endpoint(slot_number: int):
     try:
         res = await admin_rotate_slot_key(slot_number)
@@ -742,10 +783,15 @@ async def admin_rotate_key_endpoint(slot_number: int):
         logger.error(f"Error rotating key for slot #{slot_number}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.delete("/api/v1/admin/slots/{slot_number}", summary="Remove or vacate a Sovereign Voice")
+@app.delete(
+    "/api/v1/admin/slots/{slot_number}",
+    summary="Remove or vacate a Sovereign Voice",
+    dependencies=[Depends(verify_admin_auth)]
+)
 async def admin_delete_slot_endpoint(
     slot_number: int,
-    mode: str = Query("vacate", pattern="^(vacate|delete)$", description="Mode: 'vacate' to clear user and revoke key, 'delete' to remove slot entirely")
+    mode: str = Query("vacate", pattern="^(vacate|delete)$", description="Mode: 'vacate' to clear user and revoke key, 'delete' to remove slot entirely"),
+    admin_auth: bool = Depends(verify_admin_auth)
 ):
     try:
         res = await admin_delete_slot(slot_number, mode=mode)
@@ -755,7 +801,11 @@ async def admin_delete_slot_endpoint(
         logger.error(f"Error removing voice for slot #{slot_number}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/v1/admin/broadcasts", summary="List broadcasts across all voices")
+@app.get(
+    "/api/v1/admin/broadcasts",
+    summary="List broadcasts across all voices",
+    dependencies=[Depends(verify_admin_auth)]
+)
 async def admin_get_broadcasts_endpoint(
     limit: int = Query(100, ge=1, le=200),
     offset: int = Query(0, ge=0)
@@ -767,7 +817,11 @@ async def admin_get_broadcasts_endpoint(
         logger.error(f"Error fetching admin broadcasts: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.delete("/api/v1/admin/broadcasts/{broadcast_id}", summary="Delete an individual broadcast")
+@app.delete(
+    "/api/v1/admin/broadcasts/{broadcast_id}",
+    summary="Delete an individual broadcast",
+    dependencies=[Depends(verify_admin_auth)]
+)
 async def admin_delete_broadcast_endpoint(broadcast_id: int):
     try:
         slot_number = await admin_delete_broadcast(broadcast_id)
@@ -781,7 +835,11 @@ async def admin_delete_broadcast_endpoint(broadcast_id: int):
         logger.error(f"Error deleting broadcast #{broadcast_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/v1/admin/slots/10/reset-cooldown", summary="Emergency unlock/reset for Titan Slot 10 7-day cooldown")
+@app.post(
+    "/api/v1/admin/slots/10/reset-cooldown",
+    summary="Emergency unlock/reset for Titan Slot 10 7-day cooldown",
+    dependencies=[Depends(verify_admin_auth)]
+)
 async def admin_reset_cooldown_endpoint():
     try:
         await admin_reset_slot_10_cooldown()

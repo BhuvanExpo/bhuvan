@@ -1,6 +1,7 @@
 import json
 import logging
 import asyncio
+import uuid
 from typing import Optional, List, Dict, Any, Set
 import redis.asyncio as aioredis
 from app.config import settings
@@ -12,8 +13,12 @@ FEED_CACHE_KEY = "feed:latest"
 BROADCAST_CHANNEL = "channel:broadcasts"
 CACHE_TTL_SECONDS = 3600  # 1 hour rolling cache
 
-# In-memory fanout queues for connected SSE spectators
+# Unique identifier for this process instance to avoid duplicate local fanout
+_INSTANCE_ID = uuid.uuid4().hex
+
+# In-memory fanout queues for connected SSE spectators on this instance
 _local_listeners: Set[asyncio.Queue] = set()
+_subscriber_task: Optional[asyncio.Task] = None
 
 def register_listener() -> asyncio.Queue:
     """Registers a new spectator SSE queue."""
@@ -52,6 +57,7 @@ async def init_redis() -> Optional[aioredis.Redis]:
 
 async def close_redis():
     global _redis
+    await stop_redis_subscriber()
     if _redis is not None:
         await _redis.close()
         logger.info("Redis connection closed.")
@@ -62,6 +68,60 @@ async def get_redis() -> Optional[aioredis.Redis]:
     if _redis is None:
         _redis = await init_redis()
     return _redis
+
+async def start_redis_subscriber():
+    """Starts the multi-instance Redis Pub/Sub subscriber background task."""
+    global _subscriber_task
+    if _subscriber_task is None or _subscriber_task.done():
+        _subscriber_task = asyncio.create_task(_redis_subscriber_loop())
+        logger.info("Redis subscriber background task initiated.")
+
+async def stop_redis_subscriber():
+    """Stops the multi-instance Redis Pub/Sub subscriber."""
+    global _subscriber_task
+    if _subscriber_task and not _subscriber_task.done():
+        _subscriber_task.cancel()
+        try:
+            await _subscriber_task
+        except asyncio.CancelledError:
+            pass
+        _subscriber_task = None
+        logger.info("Redis subscriber background task stopped.")
+
+async def _redis_subscriber_loop():
+    """
+    Subscribes to Redis Pub/Sub channel to fan out broadcasts received from
+    other backend worker/container instances across the cluster.
+    """
+    while True:
+        try:
+            r = await get_redis()
+            if r is None:
+                await asyncio.sleep(2)
+                continue
+
+            pubsub = r.pubsub()
+            await pubsub.subscribe(BROADCAST_CHANNEL)
+            logger.info("Subscribed to Redis broadcast channel for cluster-wide SSE distribution.")
+
+            async for message in pubsub.listen():
+                if message and message.get("type") == "message":
+                    raw_data = message.get("data")
+                    if raw_data:
+                        try:
+                            payload = json.loads(raw_data)
+                            origin_instance = payload.get("_origin_id")
+                            # Only fan out if this message was published by a DIFFERENT instance
+                            if origin_instance != _INSTANCE_ID:
+                                clean_broadcast = {k: v for k, v in payload.items() if not k.startswith("_")}
+                                dispatch_local(clean_broadcast)
+                        except Exception as e:
+                            logger.error(f"Error handling pubsub broadcast: {e}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"Redis subscriber connection lost: {e}. Retrying in 3s...")
+            await asyncio.sleep(3)
 
 async def get_cached_feed(slot_number: Optional[int] = None) -> Optional[List[Dict[str, Any]]]:
     """Retrieve pre-cached feed from Redis memory."""
@@ -90,9 +150,9 @@ async def set_cached_feed(feed: List[Dict[str, Any]], slot_number: Optional[int]
 
 async def write_through_broadcast(broadcast: Dict[str, Any]):
     """
-    1. Instantly fans out to all connected SSE clients on this instance.
+    1. Instantly fans out to all connected SSE clients on THIS local instance.
     2. Prepends the new broadcast to the cached feed in Redis.
-    3. Publishes to Redis pub/sub channel for other instances.
+    3. Publishes to Redis pub/sub channel for all other instances in the cluster.
     """
     # 1. Instant local memory fanout (zero latency)
     dispatch_local(broadcast)
@@ -116,8 +176,10 @@ async def write_through_broadcast(broadcast: Dict[str, Any]):
         slot_feed = slot_feed[:100]
         await r.set(slot_key, json.dumps(slot_feed), ex=CACHE_TTL_SECONDS)
 
-        # 4. Multi-instance Pub/Sub publish
-        await r.publish(BROADCAST_CHANNEL, json.dumps(broadcast))
+        # 4. Multi-instance Pub/Sub publish with origin instance tag
+        payload = dict(broadcast)
+        payload["_origin_id"] = _INSTANCE_ID
+        await r.publish(BROADCAST_CHANNEL, json.dumps(payload))
     except Exception as e:
         logger.error(f"Redis write_through_broadcast error: {e}")
 

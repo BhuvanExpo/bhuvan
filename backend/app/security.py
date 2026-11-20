@@ -1,8 +1,11 @@
 import base64
+import secrets
 from datetime import datetime, timezone
+from typing import Tuple, Optional
 import nacl.signing
 import nacl.exceptions
-from typing import Tuple
+from fastapi import Header, HTTPException, status
+from app.config import settings
 
 def parse_iso_or_epoch(timestamp_str: str) -> datetime:
     """
@@ -18,7 +21,6 @@ def parse_iso_or_epoch(timestamp_str: str) -> datetime:
 
     # Parse ISO format
     try:
-        # Replace trailing 'Z' with +00:00 for fromisoformat compatibility
         cleaned = timestamp_str.replace("Z", "+00:00")
         dt = datetime.fromisoformat(cleaned)
         if dt.tzinfo is None:
@@ -94,3 +96,40 @@ def verify_signature(public_key_hex: str, canonical_bytes: bytes, signature_b64:
         return True
     except (nacl.exceptions.BadSignatureError, nacl.exceptions.CryptoError, ValueError, Exception):
         return False
+
+def verify_admin_auth(
+    authorization: Optional[str] = Header(None),
+    x_admin_key: Optional[str] = Header(None)
+) -> bool:
+    """
+    Validates that incoming admin command center requests provide the correct ADMIN_SECRET_KEY.
+    Accepts either:
+      - Header 'Authorization: Bearer <ADMIN_SECRET_KEY>'
+      - Header 'X-Admin-Key: <ADMIN_SECRET_KEY>'
+    Uses constant-time comparison to prevent timing side-channel attacks.
+    """
+    expected = settings.ADMIN_SECRET_KEY
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="ADMIN_SECRET_KEY is not configured on the server."
+        )
+
+    provided = None
+    if isinstance(x_admin_key, str) and x_admin_key.strip():
+        provided = x_admin_key.strip()
+    elif isinstance(authorization, str) and authorization.strip():
+        parts = authorization.strip().split()
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            provided = parts[1]
+        elif len(parts) == 1:
+            provided = parts[0]
+
+    if not provided or not secrets.compare_digest(provided, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Command Center Access Denied. Valid Admin Secret Key required.",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+
+    return True

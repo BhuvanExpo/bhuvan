@@ -44,6 +44,13 @@ export default function AdminDashboardPage() {
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
 
+  // Admin Authentication State
+  const [adminKey, setAdminKey] = useState<string>("");
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState<boolean>(false);
+  const [authInput, setAuthInput] = useState<string>("");
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [isVerifyingKey, setIsVerifyingKey] = useState<boolean>(false);
+
   // Slide-out Drawer state ("add" | "edit" | null)
   const [drawerMode, setDrawerMode] = useState<"add" | "edit" | null>(null);
   const [editingSlot, setEditingSlot] = useState<SlotStatus | null>(null);
@@ -87,22 +94,99 @@ export default function AdminDashboardPage() {
     setTimeout(() => setToastMessage(null), 3000);
   };
 
+  // Authenticated fetch wrapper for Admin Command Center API
+  const adminFetch = async (url: string, options: RequestInit = {}, keyOverride?: string) => {
+    const key = keyOverride || adminKey || (typeof window !== "undefined" ? sessionStorage.getItem("bhuvan_admin_secret_key") : "") || "";
+    const headers = new Headers(options.headers || {});
+    if (key) {
+      headers.set("Authorization", `Bearer ${key}`);
+    }
+    const res = await fetch(url, { ...options, headers });
+    if (res.status === 401) {
+      sessionStorage.removeItem("bhuvan_admin_secret_key");
+      setAdminKey("");
+      setIsAuthModalOpen(true);
+      setAuthError("Admin session expired or key invalid. Please re-authenticate.");
+    }
+    return res;
+  };
+
   useEffect(() => {
     setMounted(true);
-    loadDashboardData();
+    const savedKey = typeof window !== "undefined" ? sessionStorage.getItem("bhuvan_admin_secret_key") : null;
+    if (savedKey) {
+      setAdminKey(savedKey);
+      loadDashboardData(savedKey);
+    } else {
+      setIsAuthModalOpen(true);
+      // Load slots metadata for background display
+      fetch(`${API_BASE_URL}/api/v1/slots`, { cache: "no-store" })
+        .then((res) => res.json())
+        .then((data) => setSlots(data.slots || []))
+        .catch(() => {});
+      setIsLoading(false);
+    }
   }, []);
 
+  const handleVerifyKey = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    const candidate = authInput.trim();
+    if (!candidate) {
+      setAuthError("Please enter the Admin Secret Key.");
+      return;
+    }
+
+    try {
+      setIsVerifyingKey(true);
+      setAuthError(null);
+      const res = await fetch(`${API_BASE_URL}/api/v1/admin/stats`, {
+        headers: { "Authorization": `Bearer ${candidate}` },
+        cache: "no-store",
+      });
+
+      if (res.status === 401) {
+        setAuthError("Invalid Admin Secret Key. Access denied.");
+        return;
+      }
+
+      if (!res.ok) {
+        throw new Error(`Server returned error code: ${res.status}`);
+      }
+
+      sessionStorage.setItem("bhuvan_admin_secret_key", candidate);
+      setAdminKey(candidate);
+      setIsAuthModalOpen(false);
+      showToast("Command Center unlocked.");
+      loadDashboardData(candidate);
+    } catch (err: any) {
+      setAuthError(err.message || "Failed to verify key with backend.");
+    } finally {
+      setIsVerifyingKey(false);
+    }
+  };
+
+  const handleLockConsole = () => {
+    sessionStorage.removeItem("bhuvan_admin_secret_key");
+    setAdminKey("");
+    setStats(null);
+    setBroadcasts([]);
+    setAuthInput("");
+    setAuthError(null);
+    setIsAuthModalOpen(true);
+    showToast("Command Center locked.");
+  };
+
   // Fetch all admin data
-  const loadDashboardData = async () => {
+  const loadDashboardData = async (keyOverride?: string) => {
     try {
       setIsRefreshing(true);
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 8000);
 
       const [statsRes, slotsRes, bcastsRes] = await Promise.all([
-        fetch(`${API_BASE_URL}/api/v1/admin/stats`, { cache: "no-store", signal: controller.signal }),
+        adminFetch(`${API_BASE_URL}/api/v1/admin/stats`, { cache: "no-store", signal: controller.signal }, keyOverride),
         fetch(`${API_BASE_URL}/api/v1/slots`, { cache: "no-store", signal: controller.signal }),
-        fetch(`${API_BASE_URL}/api/v1/admin/broadcasts?limit=100`, { cache: "no-store", signal: controller.signal }),
+        adminFetch(`${API_BASE_URL}/api/v1/admin/broadcasts?limit=100`, { cache: "no-store", signal: controller.signal }, keyOverride),
       ]);
       clearTimeout(timeoutId);
 
@@ -215,7 +299,7 @@ export default function AdminDashboardPage() {
           followers_count: Number(formFollowersCount) || 0,
         };
 
-        const res = await fetch(`${API_BASE_URL}/api/v1/admin/slots`, {
+        const res = await adminFetch(`${API_BASE_URL}/api/v1/admin/slots`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
@@ -258,7 +342,7 @@ export default function AdminDashboardPage() {
           followers_count: Number(formFollowersCount),
         };
 
-        const res = await fetch(`${API_BASE_URL}/api/v1/admin/slots/${editingSlot.slot_number}`, {
+        const res = await adminFetch(`${API_BASE_URL}/api/v1/admin/slots/${editingSlot.slot_number}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
@@ -292,7 +376,7 @@ export default function AdminDashboardPage() {
     }
 
     try {
-      const res = await fetch(`${API_BASE_URL}/api/v1/admin/slots/${slot.slot_number}/rotate-key`, {
+      const res = await adminFetch(`${API_BASE_URL}/api/v1/admin/slots/${slot.slot_number}/rotate-key`, {
         method: "POST",
       });
 
@@ -329,7 +413,7 @@ export default function AdminDashboardPage() {
     if (!removingSlot) return;
 
     try {
-      const res = await fetch(
+      const res = await adminFetch(
         `${API_BASE_URL}/api/v1/admin/slots/${removingSlot.slot_number}?mode=${mode}`,
         { method: "DELETE" }
       );
@@ -357,7 +441,7 @@ export default function AdminDashboardPage() {
     if (!confirm(`Delete transmission #${postId} from the immutable ledger?`)) return;
 
     try {
-      const res = await fetch(`${API_BASE_URL}/api/v1/admin/broadcasts/${postId}`, {
+      const res = await adminFetch(`${API_BASE_URL}/api/v1/admin/broadcasts/${postId}`, {
         method: "DELETE",
       });
 
@@ -376,7 +460,7 @@ export default function AdminDashboardPage() {
   // Emergency Unlock Titan Cooldown (Slot 10)
   const handleResetTitanCooldown = async () => {
     try {
-      const res = await fetch(`${API_BASE_URL}/api/v1/admin/slots/10/reset-cooldown`, {
+      const res = await adminFetch(`${API_BASE_URL}/api/v1/admin/slots/10/reset-cooldown`, {
         method: "POST",
       });
 
@@ -477,7 +561,7 @@ AUTHENTICATION:
 
         <div className="flex items-center space-x-2.5">
           <button
-            onClick={loadDashboardData}
+            onClick={() => loadDashboardData()}
             disabled={isRefreshing}
             className="h-8 px-2.5 rounded-lg bg-[#18191a] hover:bg-[#242526] border border-white/10 text-xs font-mono text-[#a1a1aa] hover:text-white transition-colors flex items-center space-x-1.5 disabled:opacity-50"
           >
@@ -492,6 +576,18 @@ AUTHENTICATION:
             <Key className="w-3.5 h-3.5 text-[#0095f6]" />
             <span className="hidden sm:inline">Voice Portal</span>
           </Link>
+
+          {/* Lock Console Button */}
+          {adminKey && (
+            <button
+              onClick={handleLockConsole}
+              title="Lock Command Center"
+              className="h-8 px-2.5 rounded-lg bg-[#18191a] hover:bg-red-500/20 border border-white/10 hover:border-red-500/30 text-xs font-mono text-[#a1a1aa] hover:text-red-400 transition-colors flex items-center space-x-1.5"
+            >
+              <Lock className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Lock</span>
+            </button>
+          )}
 
           {/* Prominent High-Contrast + Add Voice Member Button */}
           <button
@@ -1186,6 +1282,83 @@ AUTHENTICATION:
                 Cancel
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* ===================================================================== */}
+      {/* 9. ADMIN COMMAND CENTER AUTHENTICATION ACCESS GATE MODAL              */}
+      {/* ===================================================================== */}
+      {isAuthModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/90 backdrop-blur-md flex items-center justify-center p-4">
+          <div className="bg-[#121214] border border-white/20 rounded-2xl w-full max-w-md overflow-hidden shadow-2xl p-6 space-y-5 animate-in zoom-in-95 duration-200">
+            <div className="flex items-center space-x-3 text-white">
+              <div className="w-10 h-10 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-[#0095f6]">
+                <Shield className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="font-bold text-base text-white">
+                  Command Center Access Gate
+                </h3>
+                <p className="text-xs text-[#71767b] font-mono">
+                  Sovereign Administrator Authorization
+                </p>
+              </div>
+            </div>
+
+            <p className="text-xs text-[#a1a1aa] leading-relaxed">
+              This node is protected. Enter the high-entropy <code className="text-white font-mono bg-white/5 px-1 py-0.5 rounded">ADMIN_SECRET_KEY</code> to decrypt telemetry and access administrative authority.
+            </p>
+
+            <form onSubmit={handleVerifyKey} className="space-y-4">
+              <div>
+                <label className="block text-xs font-mono font-medium text-[#71767b] mb-1.5 uppercase">
+                  Admin Secret Key
+                </label>
+                <div className="relative">
+                  <input
+                    type="password"
+                    value={authInput}
+                    onChange={(e) => {
+                      setAuthInput(e.target.value);
+                      if (authError) setAuthError(null);
+                    }}
+                    placeholder="Enter ADMIN_SECRET_KEY..."
+                    autoFocus
+                    className="w-full bg-[#18191a] border border-white/15 focus:border-[#0095f6] rounded-xl px-3.5 py-2.5 text-xs font-mono text-white placeholder-[#71767b] outline-none transition-colors"
+                  />
+                  <Key className="w-4 h-4 text-[#71767b] absolute right-3 top-3 pointer-events-none" />
+                </div>
+                {authError && (
+                  <p className="text-xs text-red-400 mt-2 flex items-center space-x-1">
+                    <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                    <span>{authError}</span>
+                  </p>
+                )}
+              </div>
+
+              <div className="flex items-center justify-between pt-2">
+                <Link
+                  href="/"
+                  className="text-xs font-mono text-[#71767b] hover:text-white transition-colors"
+                >
+                  Return to Feed
+                </Link>
+
+                <button
+                  type="submit"
+                  disabled={isVerifyingKey || !authInput.trim()}
+                  className="h-9 px-5 rounded-xl bg-[#0095f6] hover:bg-[#1877f2] disabled:opacity-50 text-white text-xs font-semibold flex items-center space-x-2 transition-all shadow-[0_0_15px_rgba(0,149,246,0.3)] active:scale-95 cursor-pointer"
+                >
+                  {isVerifyingKey ? (
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Unlock className="w-3.5 h-3.5" />
+                  )}
+                  <span>Unlock Console</span>
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}
