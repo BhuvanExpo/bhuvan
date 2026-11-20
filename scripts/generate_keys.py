@@ -90,5 +90,26 @@ def main():
     print("Generation complete. Store the private keys securely.")
     print("=" * 80)
 
+    # Save to local offline json (protected by .gitignore)
+    import json
+    from pathlib import Path
+    out_file = Path(__file__).resolve().parent / "genesis_keys_offline.json"
+    offline_data = {
+        "generated_at": str(nacl.signing.SigningKey.generate().verify_key.encode().hex())[:0] + "UTC",
+        "slots": [
+            {
+                "slot_number": kp["slot_number"],
+                "category": kp["category"],
+                "private_key_hex": kp["private_key"],
+                "public_key_hex": kp["public_key"]
+            }
+            for kp in keypairs
+        ]
+    }
+    with open(out_file, "w") as f:
+        json.dump(offline_data, f, indent=2)
+    print(f"\n[OK] Offline keys saved locally to: {out_file}")
+    print("     (This file is in .gitignore and will never be committed to Git).")
+
 if __name__ == "__main__":
     main()
